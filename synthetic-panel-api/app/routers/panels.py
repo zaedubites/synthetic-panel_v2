@@ -1,11 +1,16 @@
 """
 Panel CRUD and session endpoints.
 """
+import base64
+import json
 import logging
 import random
+import uuid as uuid_mod
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
+
+import redis as _redis
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -38,9 +43,34 @@ from app.schemas import (
     PanelStartResponse,
     PanelTranscriptResponse,
     PanelUpdate,
+    TaskDispatchResponse,
 )
 
 logger = logging.getLogger(__name__)
+
+# Redis helpers for celery task dispatch
+_redis_client = None
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = _redis.from_url(settings.redis_connection_url)
+    return _redis_client
+
+def _send_celery_task(task_name, args):
+    task_id = str(uuid_mod.uuid4())
+    body_tuple = (args, {}, {"callbacks": None, "errbacks": None, "chain": None, "chord": None})
+    body_json = json.dumps(body_tuple)
+    body_b64 = base64.b64encode(body_json.encode("utf-8")).decode("utf-8")
+    message = json.dumps({
+        "body": body_b64,
+        "content-encoding": "utf-8",
+        "content-type": "application/json",
+        "headers": {"lang": "py", "task": task_name, "id": task_id, "root_id": task_id, "parent_id": None, "group": None, "origin": "synthetic-panel-api"},
+        "properties": {"correlation_id": task_id, "reply_to": "", "delivery_mode": 2, "delivery_info": {"exchange": "", "routing_key": "simulations"}, "body_encoding": "base64", "delivery_tag": task_id},
+    })
+    _get_redis().lpush("simulations", message)
+    return task_id
 
 router = APIRouter(prefix="/panels", tags=["Panels"])
 
@@ -363,7 +393,12 @@ async def end_panel(
     count_result = await db.execute(count_query)
     message_count = count_result.scalar() or 0
 
-    # TODO: Trigger analysis generation if requested
+    # Trigger analysis generation automatically
+    try:
+        task_id = _send_celery_task("simulations.generate_panel_analysis", [str(panel_id)])
+        logger.info(f"Dispatched analysis task {task_id} for panel {panel_id}")
+    except Exception as e:
+        logger.warning(f"Failed to dispatch analysis task for panel {panel_id}: {e}")
 
     return PanelEndResponse(
         panel_id=panel.id,
@@ -519,6 +554,40 @@ The research topic is: {panel.research_goal or 'general discussion'}"""
     )
 
 
+@router.post("/{panel_id}/background")
+async def run_panel_background(
+    panel_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: TokenPayload = Depends(get_current_user),
+    org_filter: OrganizationFilter = Depends(get_organization_filter),
+):
+    """
+    Run panel conversation in background (server-side, no WebSocket needed).
+    Dispatches a celery task that runs the full discussion autonomously.
+    """
+    query = select(Panel).where(Panel.id == panel_id)
+    if org_filter.should_filter():
+        query = query.where(Panel.organization_id == org_filter.organization_id)
+
+    result = await db.execute(query)
+    panel = result.scalar_one_or_none()
+
+    if not panel:
+        raise HTTPException(status_code=404, detail="Panel not found")
+
+    # Set status to background
+    panel.status = "active"
+    if not panel.started_at:
+        panel.started_at = datetime.utcnow()
+    await db.flush()
+
+    # Dispatch celery task
+    task_id = _send_celery_task("simulations.run_panel_background", [str(panel_id)])
+    logger.info(f"Dispatched background panel task: {task_id} for panel {panel_id}")
+
+    return {"task_id": task_id, "status": "processing"}
+
+
 @router.get("/{panel_id}/transcript", response_model=PanelTranscriptResponse)
 async def get_transcript(
     panel_id: UUID,
@@ -589,16 +658,16 @@ async def get_panel_analysis(
     )
 
 
-@router.post("/{panel_id}/analyze", response_model=PanelAnalysisListResponse)
-async def generate_panel_analysis(
+@router.post("/{panel_id}/analyze", response_model=TaskDispatchResponse, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_panel_analysis(
     panel_id: UUID,
-    request: PanelRegenerateAnalysisRequest,
     db: AsyncSession = Depends(get_db),
     current_user: TokenPayload = Depends(get_current_user),
     org_filter: OrganizationFilter = Depends(get_organization_filter),
 ):
     """
-    Generate or regenerate analysis for a panel.
+    Manually trigger analysis generation for a completed panel.
+    Dispatches a celery task and returns the task ID.
     """
     query = select(Panel).where(Panel.id == panel_id)
     if org_filter.should_filter():
@@ -616,15 +685,7 @@ async def generate_panel_analysis(
             detail="Panel must be completed to generate analysis",
         )
 
-    # TODO: Generate analysis using AI service
-    # This will be implemented in Phase 2
+    task_id = _send_celery_task("simulations.generate_panel_analysis", [str(panel_id)])
+    logger.info(f"Dispatched analysis task {task_id} for panel {panel_id}")
 
-    # Return existing analyses for now
-    analyses_query = select(PanelAnalysis).where(PanelAnalysis.panel_id == panel_id)
-    analyses_result = await db.execute(analyses_query)
-    analyses = analyses_result.scalars().all()
-
-    return PanelAnalysisListResponse(
-        panel_id=panel_id,
-        analyses=[PanelAnalysisResponse.model_validate(a) for a in analyses],
-    )
+    return TaskDispatchResponse(task_id=task_id, status="processing")

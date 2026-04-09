@@ -24,6 +24,57 @@ export default function PanelList() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
+  const [selectedIds, setSelectedIds] = useState(new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+
+  const toggleSelect = (e, id) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === panels.length) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(panels.map(p => p.id)))
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    if (selectedIds.size === 0) return
+    if (!window.confirm(`Delete ${selectedIds.size} session${selectedIds.size !== 1 ? 's' : ''}? This cannot be undone.`)) return
+    setBulkDeleting(true)
+    try {
+      await Promise.all(Array.from(selectedIds).map(id => panelsApi.delete(id)))
+      setPanels(prev => prev.filter(p => !selectedIds.has(p.id)))
+      setSelectedIds(new Set())
+    } catch (error) {
+      console.error('Bulk delete failed:', error)
+      alert('Some sessions could not be deleted')
+    } finally {
+      setBulkDeleting(false)
+    }
+  }
+
+  const handleDelete = async (e, id) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (!window.confirm('Are you sure you want to delete this session? This cannot be undone.')) return
+    try {
+      await panelsApi.delete(id)
+      setPanels(prev => prev.filter(p => p.id !== id))
+      setSelectedIds(prev => { const next = new Set(prev); next.delete(id); return next })
+    } catch (error) {
+      console.error('Failed to delete panel:', error)
+      alert('Failed to delete session')
+    }
+  }
 
   useEffect(() => {
     async function fetchPanels() {
@@ -92,6 +143,38 @@ export default function PanelList() {
         </select>
       </div>
 
+      {/* Bulk Actions Bar */}
+      {panels.length > 0 && (
+        <div className="flex items-center gap-4 px-4 py-2.5 bg-white border border-gray-200 rounded-xl">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={selectedIds.size === panels.length && panels.length > 0}
+              onChange={toggleSelectAll}
+              className="rounded border-gray-300 text-primary focus:ring-primary"
+            />
+            <span className="text-sm text-gray-600">
+              {selectedIds.size > 0 ? `${selectedIds.size} selected` : 'Select all'}
+            </span>
+          </label>
+          {selectedIds.size > 0 && (
+            <>
+              <div className="h-5 w-px bg-gray-200" />
+              <button
+                onClick={handleBulkDelete}
+                disabled={bulkDeleting}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition disabled:opacity-50"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                {bulkDeleting ? 'Deleting...' : `Delete ${selectedIds.size}`}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Content */}
       {loading ? (
         <div className="flex items-center justify-center py-20">
@@ -125,10 +208,30 @@ export default function PanelList() {
               className="group rounded-2xl bg-white border border-gray-200 p-5 hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5 transition-all duration-200"
             >
               <div className="flex items-start justify-between mb-3">
-                <StatusBadge status={panel.status} />
-                <svg className="w-4 h-4 text-gray-300 group-hover:text-primary transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(panel.id)}
+                    onClick={(e) => toggleSelect(e, panel.id)}
+                    onChange={() => {}}
+                    className="rounded border-gray-300 text-primary focus:ring-primary"
+                  />
+                  <StatusBadge status={panel.status} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={(e) => handleDelete(e, panel.id)}
+                    className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition opacity-0 group-hover:opacity-100"
+                    title="Delete session"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                  </button>
+                  <svg className="w-4 h-4 text-gray-300 group-hover:text-primary transition" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                </div>
               </div>
               <h3 className="font-semibold text-gray-900 mb-1 group-hover:text-primary transition line-clamp-2">
                 {panel.research_goal || panel.name || 'Untitled Panel'}

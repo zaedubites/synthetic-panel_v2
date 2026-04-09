@@ -215,7 +215,15 @@ async def _save_and_format_message(
 # ---------------------------------------------------------------------------
 # Helper: build system prompt for a persona
 # ---------------------------------------------------------------------------
-def _persona_system_prompt(persona: Persona, research_goal: str) -> str:
+LANG_NAMES = {"en": "English", "de": "German", "es": "Spanish", "fr": "French", "it": "Italian"}
+
+
+def _persona_system_prompt(persona: Persona, research_goal: str, language: str = "en") -> str:
+    lang_instruction = ""
+    if language and language != "en":
+        lang_name = LANG_NAMES.get(language, language)
+        lang_instruction = f"\nIMPORTANT: You MUST respond in {lang_name}. All your responses must be in {lang_name}.\n"
+
     return (
         f"You are {persona.name}, a {persona.age or 'unknown age'}-year-old "
         f"{persona.gender or ''} from {persona.city or persona.country or 'unknown location'}.\n"
@@ -229,6 +237,7 @@ def _persona_system_prompt(persona: Persona, research_goal: str) -> str:
         "Keep responses conversational, 2-4 sentences. Be authentic to your personality and background.\n"
         "Do NOT prefix your response with your name or any label.\n"
         f"The research topic is: {research_goal or 'general discussion'}"
+        f"{lang_instruction}"
     )
 
 
@@ -271,6 +280,7 @@ async def _auto_continuation(
                 await db.flush()
 
             research_goal = panel.research_goal or "general discussion"
+            panel_language = panel.language or "en"
             moderator_id = panel.moderator_id
             participant_ids = panel.participant_ids or []
 
@@ -324,11 +334,27 @@ async def _auto_continuation(
         # Moderator welcome
         mod_name = moderator.name if moderator else "Moderator"
         persona_names = ", ".join(p.name for p in personas)
-        opening_text = (
-            f"Welcome everyone. Today we'll be discussing: {research_goal}. "
-            f"Let me introduce our panel members: {persona_names}. "
-            "Let's start by having each of you briefly introduce yourselves."
-        )
+        lang_name = LANG_NAMES.get(panel_language, "English")
+        mod_lang_instruction = f" Respond in {lang_name}." if panel_language != "en" else ""
+
+        if panel_language != "en":
+            try:
+                opening_text, _ = await ai_service.generate_completion(
+                    messages=[
+                        {"role": "system", "content": f"You are {mod_name}, a professional focus group moderator. Respond in {lang_name}."},
+                        {"role": "user", "content": f"Welcome the panel members ({persona_names}) and introduce the research topic: {research_goal}. Ask them to briefly introduce themselves. 2-3 sentences in {lang_name}."},
+                    ],
+                    max_tokens=200, temperature=0.7,
+                )
+                opening_text = opening_text.strip()
+            except Exception:
+                opening_text = f"Welcome everyone. Today we'll be discussing: {research_goal}. Let me introduce: {persona_names}. Please introduce yourselves."
+        else:
+            opening_text = (
+                f"Welcome everyone. Today we'll be discussing: {research_goal}. "
+                f"Let me introduce our panel members: {persona_names}. "
+                "Let's start by having each of you briefly introduce yourselves."
+            )
         await send_message("moderator", opening_text)
         add_to_history("moderator", mod_name, opening_text)
 
@@ -347,7 +373,7 @@ async def _auto_continuation(
                 await asyncio.sleep(0.5)
 
             intro_messages = [
-                {"role": "system", "content": _persona_system_prompt(persona, research_goal)},
+                {"role": "system", "content": _persona_system_prompt(persona, research_goal, panel_language)},
                 {
                     "role": "user",
                     "content": (
@@ -376,21 +402,54 @@ async def _auto_continuation(
             return
 
         # Moderator transition
-        transition_text = "Thank you all for those introductions. Let's dive into our discussion."
+        if panel_language != "en":
+            try:
+                transition_text, _ = await ai_service.generate_completion(
+                    messages=[
+                        {"role": "system", "content": f"You are {mod_name}, a moderator. Respond in {lang_name}."},
+                        {"role": "user", "content": f"Thank the panel for their introductions and transition to the discussion. 1 sentence in {lang_name}."},
+                    ],
+                    max_tokens=80, temperature=0.7,
+                )
+                transition_text = transition_text.strip()
+            except Exception:
+                transition_text = "Thank you all. Let's begin our discussion."
+        else:
+            transition_text = "Thank you all for those introductions. Let's dive into our discussion."
         await send_message("moderator", transition_text)
         add_to_history("moderator", mod_name, transition_text)
         await asyncio.sleep(2.0)
 
         # ========== PHASE 2: Discussion Rounds ==========
-        moderator_questions = [
-            f"What are your initial thoughts on {research_goal}?",
-            "Can anyone share a personal experience related to this?",
-            "How does this affect your daily life or decisions?",
-            "Does anyone have a different perspective on this?",
-            "What do you think is the most important aspect we haven't discussed yet?",
-            "How do you see this changing in the future?",
-            "What would you recommend or suggest regarding this topic?",
-        ]
+        if panel_language != "en":
+            # Generate questions in target language
+            try:
+                q_text, _ = await ai_service.generate_completion(
+                    messages=[
+                        {"role": "system", "content": f"Generate 7 focus group discussion questions in {lang_name} about the topic. Return one question per line, no numbering."},
+                        {"role": "user", "content": f"Topic: {research_goal}"},
+                    ],
+                    max_tokens=400, temperature=0.7,
+                )
+                moderator_questions = [q.strip() for q in q_text.strip().split("\n") if q.strip()]
+                if not moderator_questions:
+                    raise ValueError("Empty")
+            except Exception:
+                moderator_questions = [
+                    f"What are your initial thoughts on {research_goal}?",
+                    "Can anyone share a personal experience related to this?",
+                    "How does this affect your daily life or decisions?",
+                ]
+        else:
+            moderator_questions = [
+                f"What are your initial thoughts on {research_goal}?",
+                "Can anyone share a personal experience related to this?",
+                "How does this affect your daily life or decisions?",
+                "Does anyone have a different perspective on this?",
+                "What do you think is the most important aspect we haven't discussed yet?",
+                "How do you see this changing in the future?",
+                "What would you recommend or suggest regarding this topic?",
+            ]
         question_idx = 0
 
         for round_num in range(MAX_ROUNDS):
@@ -419,7 +478,7 @@ async def _auto_continuation(
                                     f"You are {mod_name}, a professional focus group moderator. "
                                     f"The research topic is: {research_goal}. "
                                     "Based on the conversation so far, ask a thoughtful follow-up question "
-                                    "to deepen the discussion. Keep it to one sentence."
+                                    f"to deepen the discussion. Keep it to one sentence.{mod_lang_instruction}"
                                 ),
                             },
                             {"role": "user", "content": f"Conversation so far:\n{history_as_text()}\n\nAsk a follow-up question:"},
@@ -450,7 +509,7 @@ async def _auto_continuation(
                     break
 
                 ai_messages = [
-                    {"role": "system", "content": _persona_system_prompt(persona, research_goal)},
+                    {"role": "system", "content": _persona_system_prompt(persona, research_goal, panel_language)},
                 ]
 
                 # Add conversation history
@@ -486,10 +545,23 @@ async def _auto_continuation(
 
         # ========== PHASE 3: Closing ==========
         if not stop_event.is_set():
-            closing_text = (
-                "Thank you all for such a rich and insightful discussion. "
-                "Your perspectives have been incredibly valuable. That concludes our panel for today."
-            )
+            if panel_language != "en":
+                try:
+                    closing_text, _ = await ai_service.generate_completion(
+                        messages=[
+                            {"role": "system", "content": f"You are {mod_name}, a moderator. Respond in {lang_name}."},
+                            {"role": "user", "content": f"Thank the panel members for their discussion and close the session. 2 sentences in {lang_name}."},
+                        ],
+                        max_tokens=100, temperature=0.7,
+                    )
+                    closing_text = closing_text.strip()
+                except Exception:
+                    closing_text = "Thank you all for this discussion. That concludes our panel."
+            else:
+                closing_text = (
+                    "Thank you all for such a rich and insightful discussion. "
+                    "Your perspectives have been incredibly valuable. That concludes our panel for today."
+                )
             await send_message("moderator", closing_text)
 
         await manager.send_to_connection(websocket, {"type": "session_ended"})
@@ -535,6 +607,7 @@ async def _handle_user_question(
                 return
 
             research_goal = panel.research_goal or "general discussion"
+            panel_language = panel.language or "en"
             moderator_id = panel.moderator_id
             participant_ids = panel.participant_ids or []
 
@@ -588,7 +661,7 @@ async def _handle_user_question(
 
         for persona in responders:
             ai_messages = [
-                {"role": "system", "content": _persona_system_prompt(persona, research_goal)},
+                {"role": "system", "content": _persona_system_prompt(persona, research_goal, panel_language)},
             ]
             for msg in history[-10:]:
                 if msg.role == "user":

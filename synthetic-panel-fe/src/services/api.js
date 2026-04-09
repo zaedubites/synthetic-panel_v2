@@ -177,8 +177,11 @@ export const panelsApi = {
 
   // Analysis
   getAnalysis: (id) => api.get(`/panels/${id}/analysis`),
-  generateAnalysis: (id, data) => api.post(`/panels/${id}/analyze`, data),
+  generateAnalysis: (id) => api.post(`/panels/${id}/analyze`, {}),
   generateFollowups: (id, data) => api.post(`/panels/${id}/generate-followups`, data),
+
+  // Background run
+  runBackground: (id) => api.post(`/panels/${id}/background`),
 }
 
 // ============================================

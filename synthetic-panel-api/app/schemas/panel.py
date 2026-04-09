@@ -128,9 +128,10 @@ class PanelAnalysisResponse(IDSchema):
     panel_id: UUID
     analysis_type: str
     content: Optional[str] = None
-    structured_data: dict[str, Any] = Field(default_factory=dict)
+    structured_data: Optional[dict[str, Any]] = Field(default_factory=dict)
     model_used: Optional[str] = None
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
 
 
 class PanelAnalysisListResponse(BaseSchema):

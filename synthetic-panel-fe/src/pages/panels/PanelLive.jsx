@@ -277,6 +277,10 @@ export default function PanelLive() {
   const [sending, setSending] = useState(false)
   const [handRaised, setHandRaised] = useState(false)
   const [waitingForQuestion, setWaitingForQuestion] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [autoSendCountdown, setAutoSendCountdown] = useState(null)
+  const recognitionRef = useRef(null)
+  const countdownRef = useRef(null)
 
   // Audio
   const [audioQueue, setAudioQueue] = useState([])
@@ -721,6 +725,130 @@ export default function PanelLive() {
     setHandRaised(false)
     setWaitingForQuestion(false)
     setInput('')
+    stopRecording()
+  }
+
+  // Speech recognition — matches reference app pattern
+  const silenceTimeoutRef = useRef(null)
+  const countdownIntervalRef = useRef(null)
+  const lastTranscriptRef = useRef('')
+
+  const startRecording = () => {
+    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognitionAPI) {
+      alert('Speech recognition is not supported in this browser. Try Chrome or Edge.')
+      return
+    }
+
+    if (isRecording || sending) return
+
+    // Clear any pending timers
+    if (silenceTimeoutRef.current) { clearTimeout(silenceTimeoutRef.current); silenceTimeoutRef.current = null }
+    if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null }
+    setAutoSendCountdown(null)
+    lastTranscriptRef.current = ''
+
+    const recognition = new SpeechRecognitionAPI()
+    recognition.continuous = true
+    recognition.interimResults = true
+    // Set language based on panel language
+    const langMap = { en: 'en-US', de: 'de-DE', es: 'es-ES', fr: 'fr-FR', it: 'it-IT' }
+    recognition.lang = langMap[panel?.language] || 'en-US'
+
+    recognition.onstart = () => setIsRecording(true)
+
+    recognition.onend = () => {
+      // If recognition ends with pending text, send it
+      if (lastTranscriptRef.current.trim() && !sending) {
+        const text = lastTranscriptRef.current.trim()
+        lastTranscriptRef.current = ''
+        setInput('')
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'send_message', content: text }))
+        }
+      }
+      setIsRecording(false)
+      setAutoSendCountdown(null)
+    }
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0].transcript)
+        .join('')
+      setInput(transcript)
+      lastTranscriptRef.current = transcript
+
+      // Clear pending timers
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+      if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null }
+      setAutoSendCountdown(null)
+
+      // Check if any result is final
+      const hasFinal = Array.from(event.results).some((r) => r.isFinal)
+
+      if (hasFinal && transcript.trim()) {
+        // Start 2-second auto-send countdown
+        const countdownSeconds = 2
+        setAutoSendCountdown(countdownSeconds)
+
+        let remaining = countdownSeconds
+        countdownIntervalRef.current = setInterval(() => {
+          remaining -= 1
+          if (remaining > 0) {
+            setAutoSendCountdown(remaining)
+          } else {
+            clearInterval(countdownIntervalRef.current)
+            countdownIntervalRef.current = null
+            setAutoSendCountdown(null)
+          }
+        }, 1000)
+
+        // Auto-send after countdown
+        silenceTimeoutRef.current = setTimeout(() => {
+          if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null }
+          setAutoSendCountdown(null)
+
+          const text = lastTranscriptRef.current.trim()
+          lastTranscriptRef.current = ''
+          setInput('')
+
+          if (text && !sending) {
+            recognition.stop()
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'send_message', content: text }))
+            }
+          }
+        }, countdownSeconds * 1000)
+      }
+    }
+
+    recognition.onerror = (event) => {
+      setIsRecording(false)
+      setAutoSendCountdown(null)
+      // Ignore common non-errors
+      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        console.warn('Speech recognition error:', event.error)
+      }
+    }
+
+    recognitionRef.current = recognition
+    recognition.start()
+  }
+
+  const stopRecording = () => {
+    if (silenceTimeoutRef.current) { clearTimeout(silenceTimeoutRef.current); silenceTimeoutRef.current = null }
+    if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null }
+    setAutoSendCountdown(null)
+    setIsRecording(false)
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop() } catch {}
+      recognitionRef.current = null
+    }
+  }
+
+  const toggleRecording = () => {
+    if (isRecording) stopRecording()
+    else startRecording()
   }
 
   // ---------------------------------------------------------------------------
@@ -774,15 +902,56 @@ export default function PanelLive() {
   }
 
   const handleBackground = () => {
-    // Stop audio, close WebSocket, navigate immediately
+    // Stop audio and close WebSocket
     audioRef.current.pause()
     setAudioQueue([])
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      // Don't send stop_session — let it keep running in the background
+    if (wsRef.current) {
+      wsRef.current.onclose = null // prevent reconnection
       wsRef.current.close()
+      wsRef.current = null
     }
-    wsRef.current = null
+
+    // Show toast notification
+    const toast = document.createElement('div')
+    toast.className = 'fixed bottom-6 right-6 z-[100] bg-white border border-gray-200 rounded-xl px-5 py-4 shadow-2xl flex items-center gap-3'
+    toast.style.animation = 'slideUp 0.3s ease-out'
+    toast.innerHTML = `
+      <div class="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
+        <svg class="w-4 h-4 text-primary animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+      </div>
+      <div>
+        <p class="font-medium text-gray-900 text-sm">Running panel in background</p>
+        <p class="text-xs text-gray-500">We'll notify you when it's ready</p>
+      </div>
+    `
+    if (!document.getElementById('toast-anim')) {
+      const style = document.createElement('style')
+      style.id = 'toast-anim'
+      style.textContent = '@keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }'
+      document.head.appendChild(style)
+    }
+    document.body.appendChild(toast)
+    setTimeout(() => {
+      toast.style.opacity = '0'
+      toast.style.transform = 'translateY(20px)'
+      toast.style.transition = 'all 0.3s ease-out'
+      setTimeout(() => toast.remove(), 300)
+    }, 5000)
+
+    // Navigate immediately
     navigate('/panels')
+
+    // Fire-and-forget background generation
+    panelsApi.background?.(id) || fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8003'}/api/panels/${id}/background`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${localStorage.getItem('synthetic_panel_token')}`,
+        'X-Organization-Id': JSON.parse(localStorage.getItem('synthetic_panel_org') || '{}').id || '',
+      },
+    }).catch(err => console.error('Background generation error:', err))
   }
 
   const handleDiscard = async () => {
@@ -1015,19 +1184,49 @@ export default function PanelLive() {
                 <p className="text-sm text-primary font-medium">The moderator has called on you — ask your question:</p>
                 <button onClick={handleCancelHand} className="text-xs text-gray-400 hover:text-gray-600 transition">Cancel</button>
               </div>
-              <form onSubmit={handleSend} className="flex items-end gap-3">
+
+              {/* Auto-send countdown */}
+              {autoSendCountdown !== null && autoSendCountdown > 0 && (
+                <div className="flex items-center gap-2 text-sm text-cyan-600">
+                  <div className="w-4 h-4 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
+                  Sending in {autoSendCountdown}s...
+                  <button onClick={() => { setAutoSendCountdown(null) }} className="text-xs text-gray-400 hover:text-gray-600 ml-2">Cancel auto-send</button>
+                </div>
+              )}
+
+              <form onSubmit={handleSend} className="flex items-end gap-2">
                 <textarea
                   ref={textareaRef}
                   value={input}
-                  onChange={handleInputChange}
+                  onChange={(e) => { handleInputChange(e); setAutoSendCountdown(null) }}
                   onKeyDown={handleKeyDown}
-                  placeholder="Type your question..."
+                  placeholder={isRecording ? 'Listening... speak now' : 'Type or use mic to ask your question...'}
                   autoFocus
                   disabled={sending}
                   rows={2}
-                  className="flex-1 px-4 py-2.5 bg-gray-50 border border-primary/30 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition disabled:opacity-50 resize-none"
+                  className={`flex-1 px-4 py-2.5 bg-gray-50 border rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/20 transition disabled:opacity-50 resize-none ${
+                    isRecording ? 'border-red-300 focus:border-red-400 bg-red-50/30' : 'border-primary/30 focus:border-primary'
+                  }`}
                   style={{ maxHeight: '160px' }}
                 />
+
+                {/* Mic button */}
+                <button
+                  type="button"
+                  onClick={toggleRecording}
+                  className={`p-2.5 rounded-xl transition flex-shrink-0 ${
+                    isRecording
+                      ? 'bg-red-500 text-white animate-pulse hover:bg-red-600'
+                      : 'bg-gray-100 text-gray-500 hover:bg-cyan-50 hover:text-cyan-600'
+                  }`}
+                  title={isRecording ? 'Stop recording' : 'Speak your question'}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                </button>
+
+                {/* Send button */}
                 <button
                   type="submit"
                   disabled={sending || !input.trim()}
@@ -1048,18 +1247,34 @@ export default function PanelLive() {
 
           {/* Self-Moderated: Direct input always visible */}
           {panel?.moderation_mode !== 'ai' && (
-            <form onSubmit={handleSend} className="flex items-end gap-3">
+            <form onSubmit={handleSend} className="flex items-end gap-2">
               <textarea
                 ref={textareaRef}
                 value={input}
-                onChange={handleInputChange}
+                onChange={(e) => { handleInputChange(e); setAutoSendCountdown(null) }}
                 onKeyDown={handleKeyDown}
-                placeholder="Ask a question to the panel..."
+                placeholder={isRecording ? 'Listening... speak now' : 'Ask a question to the panel...'}
                 disabled={sending}
                 rows={2}
-                className="flex-1 px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition disabled:opacity-50 resize-none"
+                className={`flex-1 px-4 py-2.5 bg-gray-50 border rounded-xl text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/20 transition disabled:opacity-50 resize-none ${
+                  isRecording ? 'border-red-300 bg-red-50/30' : 'border-gray-200 focus:border-primary'
+                }`}
                 style={{ maxHeight: '160px' }}
               />
+              <button
+                type="button"
+                onClick={toggleRecording}
+                className={`p-2.5 rounded-xl transition flex-shrink-0 ${
+                  isRecording
+                    ? 'bg-red-500 text-white animate-pulse hover:bg-red-600'
+                    : 'bg-gray-100 text-gray-500 hover:bg-cyan-50 hover:text-cyan-600'
+                }`}
+                title={isRecording ? 'Stop recording' : 'Speak your question'}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              </button>
               <button
                 type="submit"
                 disabled={sending || !input.trim()}
